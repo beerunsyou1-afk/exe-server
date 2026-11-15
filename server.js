@@ -3,6 +3,8 @@ const http = require('http'), fs = require('fs'), path = require('path'), crypto
 const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080, ADMIN = (process.env.ADMIN_USER || 'zzz').toLowerCase();
 const FILE = path.join(process.env.DATA_DIR || __dirname, 'data.json');
+const UP = path.join(path.dirname(FILE), 'uploads'); fs.mkdirSync(UP, { recursive: true });
+const IMG = /^data:image\/(png|jpeg|webp|gif);base64,([A-Za-z0-9+\/=]+)$/;
 const COLORS = ['#f47fff', '#5865f2', '#43b581', '#faa61a', '#f04747', '#00b0f4', '#ff7a59', '#9b84ee', '#3ddc97', '#ffd166'];
 const NITRO_PRICE = 1000;
 const BADGES = { // id: [name, icon, rarity, how]
@@ -31,7 +33,7 @@ const okBanner = b => !b || /^#[0-9a-f]{6}$/i.test(b) || /^https:\/\/\S{3,400}$/
 const clients = new Set();
 const send = (ws, o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
 const bcast = o => { for (const c of clients) if (c.user) send(c, o); };
-const pub = (k, on) => { const u = db.users[k]; return { user: u.name, color: u.color, online: on, admin: isAdmin(k), nitro: u.nitro || isAdmin(k), badges: u.badges, bio: u.bio, banner: u.banner, font: u.font, effect: u.effect, frame: u.frame, joined: u.joined }; };
+const pub = (k, on) => { const u = db.users[k]; return { user: u.name, color: u.color, online: on, admin: isAdmin(k), nitro: u.nitro || isAdmin(k), badges: u.badges, bio: u.bio, bcolor: /^#/.test(u.banner || '') ? u.banner : '', av: u.avatar ? (u.avv || 1) : 0, bn: u.bnimg ? (u.bnv || 1) : 0, t1: u.t1 || '', t2: u.t2 || '', font: u.font, effect: u.effect, frame: u.frame, joined: u.joined }; };
 const presence = () => { const on = new Set([...clients].filter(c => c.user).map(c => c.user)); bcast({ t: 'presence', users: Object.keys(db.users).map(k => pub(k, on.has(k))) }); };
 const sendMe = ws => ws.user && send(ws, { t: 'me', coins: db.users[ws.user].coins });
 function autoBadges(u, k) {
@@ -43,13 +45,22 @@ function autoBadges(u, k) {
 const findCh = id => db.servers.flatMap(s => s.channels).find(c => c.id === id);
 const FONTS = 7;
 
-const srv = http.createServer((q, r) => { r.writeHead(200); r.end('Exe server is running'); });
+const srv = http.createServer((q, r) => {
+  let m;
+  if ((m = q.url.match(/^\/img\/([a-z0-9_]+)\/(av|bn)/i))) {
+    const u = db.users[m[1].toLowerCase()], d = u && (m[2] === 'av' ? u.avatar : u.bnimg), x = d && IMG.exec(d);
+    if (x) { r.writeHead(200, { 'Content-Type': 'image/' + x[1], 'Cache-Control': 'public,max-age=31536000' }); return r.end(Buffer.from(x[2], 'base64')); }
+  } else if ((m = q.url.match(/^\/u\/([a-f0-9]{12}\.(png|jpeg|webp|gif))/))) {
+    return fs.readFile(path.join(UP, m[1]), (e, b) => { if (e) { r.writeHead(404); return r.end(); } r.writeHead(200, { 'Content-Type': 'image/' + m[2], 'Cache-Control': 'public,max-age=31536000' }); r.end(b); });
+  }
+  r.writeHead(200); r.end('Exe server is running');
+});
 const wss = new WebSocketServer({ server: srv, maxPayload: 6 * 1024 * 1024 });
 wss.on('connection', ws => {
   clients.add(ws); ws.user = null; ws.stamps = [];
   ws.on('message', raw => {
-    if (raw.length > 16384 && !(ws.user && isAdmin(ws.user))) return;
     let m; try { m = JSON.parse(raw); } catch { return; }
+    if (raw.length > 16384 && !(ws.user && (isAdmin(ws.user) || ['msg', 'setimg'].includes(m.t)))) return;
     if (m.t === 'ping') return send(ws, { t: 'pong' });
     if (m.t === 'auth') {
       const name = clean(m.user, 20), key = name.toLowerCase(), pass = String(m.pass || '');
@@ -67,18 +78,23 @@ wss.on('connection', ws => {
       }
       for (const c of clients) if (c !== ws && c.user === key) c.close();
       ws.user = key; autoBadges(u, key); save();
-      send(ws, { t: 'authok', news: db.news.slice(-50), seen: u.newsSeen || 0, user: u.name, admin: isAdmin(key), coins: u.coins, servers: db.servers, badges: BADGES, price: NITRO_PRICE });
+      send(ws, { t: 'authok', ver: 3, news: db.news.slice(-50), seen: u.newsSeen || 0, user: u.name, admin: isAdmin(key), coins: u.coins, servers: db.servers, badges: BADGES, price: NITRO_PRICE });
       return presence();
     }
     if (!ws.user) return;
     const k = ws.user, u = db.users[k];
     if (m.t === 'history') return findCh(m.ch) && send(ws, { t: 'history', ch: m.ch, msgs: (db.messages[m.ch] || []).slice(-100) });
     if (m.t === 'msg') {
-      const text = clean(m.text, 2000); if (!text || !findCh(m.ch)) return;
+      const text = clean(m.text, 2000); if (!findCh(m.ch)) return;
+      let img = '';
+      if (m.img) { const x = IMG.exec(String(m.img)); if (!x || x[2].length > 2.2e6) return send(ws, { t: 'notice', msg: 'Image too big (max ~1.5MB)' });
+        if (x[1] === 'gif' && x[2].length > 1.6e6) return send(ws, { t: 'notice', msg: 'GIF too big' });
+        const id = uid() + '.' + x[1]; fs.writeFileSync(path.join(UP, id), Buffer.from(x[2], 'base64')); img = '/u/' + id; }
+      if (!text && !img) return;
       const now = Date.now(); ws.stamps = ws.stamps.filter(s => now - s < 5000);
       if (ws.stamps.length >= 8) return send(ws, { t: 'notice', msg: 'Slow down!' });
       ws.stamps.push(now);
-      const msg = { id: uid(), user: u.name, text, ts: now };
+      const msg = { id: uid(), user: u.name, text, ts: now, img };
       (db.messages[m.ch] = db.messages[m.ch] || []).push(msg); if (db.messages[m.ch].length > 500) db.messages[m.ch].shift();
       u.msgs++; u.coins += u.nitro || isAdmin(k) ? 2 : 1; // Nitro earns 2x
       const had = u.badges.length; autoBadges(u, k); save();
@@ -91,15 +107,22 @@ wss.on('connection', ws => {
       const s = db.servers.find(x => x.id === m.server), n = clean(m.name, 24).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
       if (!s || !n || s.channels.length >= 30) return; s.channels.push({ id: 'c' + uid(), name: n }); save(); return bcast({ t: 'servers', servers: db.servers });
     }
-    if (m.t === 'profile') { // free: bio, banner color, name color. Nitro: gif banner, font, effect, frame
-      const perk = u.nitro || isAdmin(k), banner = clean(m.banner, 400);
-      if (!okBanner(banner)) return send(ws, { t: 'notice', msg: 'Banner must be a #color or https:// link' });
-      if (!perk && (/^https/.test(banner) || +m.font || m.effect || m.frame)) return send(ws, { t: 'notice', msg: 'That needs Nitro!' });
-      u.bio = clean(m.bio, 190); u.banner = banner; u.font = Math.max(0, Math.min(FONTS - 1, +m.font || 0));
+    if (m.t === 'profile') {
+      const perk = u.nitro || isAdmin(k), hex = x => /^#[0-9a-f]{6}$/i.test(x || '');
+      if (!perk && (+m.font || m.effect || m.frame || m.t1 || m.t2)) return send(ws, { t: 'notice', msg: 'Fonts, effects, frames and gradients need Nitro!' });
+      u.bio = clean(m.bio, 190); u.banner = hex(m.bcolor) ? m.bcolor : ''; u.font = Math.max(0, Math.min(FONTS - 1, +m.font || 0));
       u.effect = ['', 'rainbow', 'glow', 'fire', 'neon'].includes(m.effect) ? m.effect : ''; u.frame = ['', 'gold', 'aurora', 'blossom', 'void'].includes(m.frame) ? m.frame : '';
-      if (/^#[0-9a-f]{6}$/i.test(m.color)) u.color = m.color;
+      u.t1 = perk && hex(m.t1) ? m.t1 : ''; u.t2 = perk && hex(m.t2) ? m.t2 : ''; if (hex(m.color)) u.color = m.color;
       if (Date.now() - u.lastEdit > 6e4) { u.coins += 5; u.lastEdit = Date.now(); }
       give(u, 'styled'); save(); sendMe(ws); return presence();
+    }
+    if (m.t === 'setimg') {
+      const f = m.kind === 'avatar' ? ['avatar', 'avv'] : m.kind === 'banner' ? ['bnimg', 'bnv'] : null; if (!f) return;
+      if (m.data === '') { u[f[0]] = ''; u[f[1]] = 0; }
+      else { const x = IMG.exec(String(m.data || '')); if (!x || x[2].length > 1.3e6) return send(ws, { t: 'notice', msg: 'Image too big (max ~900KB)' });
+        if (x[1] === 'gif' && !(u.nitro || isAdmin(k))) return send(ws, { t: 'notice', msg: 'Animated GIFs need Nitro (normal images are free)' });
+        u[f[0]] = m.data; u[f[1]] = Date.now(); }
+      give(u, 'styled'); save(); send(ws, { t: 'imgok', kind: m.kind }); return presence();
     }
     if (m.t === 'buy') {
       if (m.item !== 'nitro' || u.nitro) return;
